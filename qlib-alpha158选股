@@ -1,0 +1,197 @@
+import qlib
+from qlib.constant import REG_CN
+qlib.init(provider_uri="~/.qlib/qlib_data/", region=REG_CN)
+from qlib.data import D
+# 获取指定时间范围内的日频交易日历
+trade_dates = D.calendar(start_time='2020-01-01', end_time='2025-04-17')
+print(trade_dates[-5:])
+instruments=D.instruments(market='all')
+stock_list=D.list_instruments(instruments=instruments,
+                              start_time='2020-01-01',
+                              end_time='2020-04-17',
+                              as_list=True)
+print(stock_list[-5:])
+features=D.features(instruments=['SZ300826'],fields=['$open', '$high','$volume'],start_time='2020-01-01',end_time='2025-04-17')
+print(features[-5:])
+
+from qlib.data import D
+from qlib.data.filter import NameDFilter, ExpressionDFilter
+
+# 静态筛选：匹配以 SH 或 SZ 开头的股票代码
+name_filter = NameDFilter(name_rule_re='^(SH|SZ)[0-9]{6}$')
+
+# 动态筛选：收盘价大于等于 1 元
+expression_filter = ExpressionDFilter(rule_expression='$close >= 1')
+
+# 组合筛选器
+filter_pipe = [name_filter, expression_filter]
+
+# 获取符合条件的股票列表
+instruments = D.instruments(market='all', filter_pipe=filter_pipe)
+stock_list = D.list_instruments(instruments=instruments, start_time='2020-01-01', end_time='2025-04-17', as_list=True)
+
+print(stock_list[:10])  # 输出前 10 个符合条件的股票代码
+from qlib.contrib.data.handler import Alpha158
+data_handler_config = {
+    'start_time': '2020-01-01',
+    'end_time': '2025-04-17',
+    'fit_start_time': '2020-01-01',
+    'fit_end_time': '2024-04-17',
+    'instruments': instruments,
+    'learn_processors': [
+        {'class': 'DropnaLabel'},
+        {'class': 'CSZScoreNorm', 'kwargs': {'fields_group': 'label'}},
+    ],
+    'infer_processors': [
+        {'class': 'ProcessInf'},
+        {'class': 'ZScoreNorm'},
+        {'class': 'Fillna'},
+    ],
+}
+h=Alpha158(**data_handler_config)
+print(h.get_cols())
+
+Alpha158_label=h.fetch(col_set='label')
+print(Alpha158_label)
+
+alpha158_features=h.fetch(col_set='feature')
+print(alpha158_features)
+
+mport time
+import numpy as np
+import pandas as pd
+
+from qlib.contrib.model.linear import LinearModel
+from qlib.contrib.data.handler import Alpha158
+from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy
+from qlib.contrib.evaluate import (backtest_daily, risk_analysis)
+from qlib.utils import exists_qlib_data, init_instance_by_config
+from qlib.workflow import R
+from qlib.workflow.record_temp import SignalRecord,PortAnaRecord
+from qlib.utils import flatten_dict
+
+market=instruments
+benchmark='sh000300'
+#train model
+data_handler_config = {
+    'start_time': '2020-01-01',
+    'end_time': '2025-04-17',
+    'fit_start_time': '2020-01-01',
+    'fit_end_time': '2024-04-17',
+    'instruments': instruments,
+}
+task={
+    'model': {
+        'class': 'LinearModel',
+        'module_path':'qlib.contrib.model.linear',
+        'kwargs':{
+            'estimator':'ols',
+            'fit_intercept':True
+        },
+    },
+    'dataset':{
+        'class':'DatasetH',
+        'module_path':'qlib.contrib.data.dataset',
+        'kwargs':{
+            'handler':{
+                 'class':'Alpha158',
+            'module_path':'qlib.contrib.data.handler',
+            'kwargs':data_handler_config,
+            },
+            'segments':{
+                'train': ("2020-01-01", "2023-12-31"),
+                'valid': ("2024-01-01", "2024-04-17",),
+                'test': ("2024-04-18", "2025-04-17",),
+            }
+        }
+    }
+}
+model = init_instance_by_config(task['model'])
+dataset = init_instance_by_config(task['dataset'])
+
+t_start = time.time()
+with R.start(experiment_name='train_model'):
+    R.log_params(**flatten_dict(task))
+    model.fit(dataset)
+    R.save_objects(trained_model=model)
+    rid=R.get_recorder().id
+t_end = time.time()
+print('train model - Time Count: %.3fs' % (t_end - t_start))
+
+#prediction,backtest&analysis
+port_analysis_config = {
+    # 策略配置
+    "strategy": {
+        "class": "TopkDropoutStrategy",
+        "module_path": "qlib.contrib.strategy.signal_strategy",
+        "kwargs": {
+            "topk": 50,
+            "n_drop": 5,
+            'model':model,
+            'dataset':dataset,
+        },
+    },
+    # 执行器配置（必须明确指定）
+    "executor": {
+        "class": "SimulatorExecutor",
+        "module_path": "qlib.backtest.executor",
+        "kwargs": {
+            "time_per_step": "day",  # 按天回测
+            "generate_portfolio_metrics": True,  # 生成组合指标
+        },
+    },
+    # 回测参数配置
+    "backtest": {
+        "start_time": "2024-04-18",
+        "end_time": "2025-04-17",
+        "account": 100_000_000_000,# 初始资金（建议用科学计数法提高可读性）
+        "benchmark": benchmark,  # 确保 benchmark 是有效指数（如沪深300）
+        'exchange_kwargs':{
+            "deal_price": "close",  # 成交价格字段
+            "open_cost": 0.0015,  # 买入费率
+            "close_cost": 0.0015,  # 卖出费率
+            "min_cost": 20,
+            'limit_threshold': 0.095,
+            'freq':'day'
+        },
+    },
+}
+
+t_start = time.time()
+
+# 实验名称需与训练时一致
+with R.start(experiment_name="backtest_daily"):
+    # 获取训练阶段的 recorder
+    recorder = R.get_recorder(experiment_name="train_model", recorder_id=rid)
+    model = recorder.load_object("trained_model")
+    recorder=R.get_recorder()
+    ba_id=recorder.id
+
+    # 生成信号
+    sr = SignalRecord(model, dataset, recorder)
+    sr.generate()
+
+    # 配置回测参数（使用修正后的 port_analysis_config）
+    par = PortAnaRecord(recorder, port_analysis_config,'day')
+
+    # 执行回测
+    par.generate()
+
+t_end = time.time()
+print(f"Backtest - Time Cost: {t_end - t_start:.3f}s")
+
+
+from qlib.contrib.report import analysis_model, analysis_position
+from qlib.data import D
+recorder=R.get_recorder(experiment_name='train_model', recorder_id=ba_id)
+pred_df = recorder.load_object('pred.pkl')
+pred_df_dates= pred_df.index.get_level_values(level='datetime')
+report_normal_df=recorder.load_object('portfolio_analysis/report_normal_1day.pkl')
+report_normal_df=report_normal_df.dropna(axis=0)
+positions=recorder.load_object('portfolio_analysis/positions_normal_1day.pkl')
+analysis_df=recorder.load_object('portfolio_analysis/port_analysis_1day.pkl')
+#可视化分析
+label_df=dataset.prepare('test',col_set='label')
+label_df.columns=['label']
+pred_label=pd.concat([label_df,pred_df],axis=1,sort=True).reindex(label_df.index)
+analysis_position.score_ic_graph(pred_label)
